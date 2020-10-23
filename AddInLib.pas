@@ -32,6 +32,7 @@ const
   IID_IStatusLine: TGUID = '{AB634005-F13D-11D0-A459-004095E1DAEA}';
   IID_IExtWndsSupport: TGUID = '{EFE19EA0-09E4-11D2-A601-008048DA00DE}';
 type
+  LPEXCEPINFO = ^EXCEPINFO;
 
 // *********************************************************************//
 // Forward declaration of interfaces defined in Type Library            //
@@ -80,7 +81,7 @@ type
 // *********************************************************************//
   IErrorLog = interface(IUnknown)
     ['{3127CA40-446E-11CE-8135-00AA004BB851}']
-    function AddError(pszPropName: PWideChar; var pExcepInfo: EXCEPINFO): HResult; stdcall;
+    function AddError(pszPropName: PWideChar; pExcepInfo: LPEXCEPINFO): HResult; stdcall;
   end;
 
 // *********************************************************************//

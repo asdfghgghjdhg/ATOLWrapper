@@ -4,15 +4,13 @@ interface
 
 uses
   System.Win.ComServ, System.Win.ComObj, WinApi.ActiveX, System.SysUtils,
-  WinApi.Windows, System.Variants, 
+  XML.XMLIntf, XML.XMLDoc, System.Classes,
+  WinApi.Windows, System.Variants, System.Zip, System.IOUtils,
   AddInLib, AddInDefBase, MemoryManager, NativeAPILib, ComponentBase, V8Types;
 
 const
   c_AddinName = 'ATOLKKMDriverWrapper';
   CLSID_AddInObject: TGUID = '{90C66C90-7B4F-4C3E-854B-1352117E784F}';
-
-  DriverDLLName = 'fptrwin32_fz54.dll';
-  ATOLClassName = 'ATOL_KKT_1C83_V9';
 
 type
   TWrapperObject = class(TComObject, IinitDone, ILanguageExtender)
@@ -24,11 +22,11 @@ type
     //FEvent : IAsyncEvent;
     //FProfile : IPropertyProfile;
 
-    FSelfPath: WideString;
     FAddInDefBase: TAddInDefBase;
     FMemoryManager: TMemoryManager;
     FClassObject: TNativeAPIClass;
 
+    FDLLName: WideString;
     FDllHandle: HMODULE;
     FDllInfo: TVSFixedFileInfo;
 
@@ -64,13 +62,16 @@ type
 
   end;
 
+var
+  DriverClassObject: TNativeAPIClass;
+
 implementation
 
 constructor TWrapperObject.Create;
 begin
   inherited;
 
-  FSelfPath := '';
+  FDLLName := '';
   FDllHandle := 0;
   FAddInDefBase := nil;
   FMemoryManager := nil;
@@ -91,87 +92,205 @@ var
   pwcInfo: Pointer;
   pffiVersion: PVSFixedFileInfo;
   res: Integer;
+  ZipFile: TZipFile;
+  TmpDir: String;
+  XML: IXMLDocument;
+  i: Integer;
+  ATOLClassName: WideString;
+  SelfPath: WideString;
+  MethodNum: Integer;
+  V8Params: array of T1CVariant;
+  V8RetValue: T1CVariant;
+  ParamsCount: Integer;
+  SearchRec: TSearchRec;
+  DriverPackage: WideString;
 begin
   Result := True;
   SetErrorMode(SEM_FAILCRITICALERRORS);
-
-  FSelfPath := ExtractFilePath(GetModuleName(hInstance));
 
   DestroyObjectFunc := nil;
   FDllInfo.dwFileVersionMS := 0;
   FDllInfo.dwFileVersionLS := 0;
 
-  FClassObject := TNativeAPIClass.Create;
-  if (not Assigned(FMemoryManager)) then FMemoryManager := TMemoryManager.Create;
-  if (not Assigned(FAddInDefBase)) then FAddInDefBase := TAddInDefBase.Create;
+  SelfPath := ExtractFilePath(GetModuleName(hInstance));
 
-  if not FileExists(FSelfPath + DriverDllName) then
+  if System.SysUtils.FindFirst(SelfPath + 'ATOL_KKT_*.zip', faAnyFile, SearchRec) <> 0 then
     begin
-      ShowLogString('Библиотека ' + DriverDllName + ' не найдена!', ADDIN_E_FAIL);
+      ShowLogString('Пакет драйвера не найден в каталоге ' + SelfPath + '!', ADDIN_E_FAIL);
       Result := False;
     end
   else
     begin
-      strLen := GetFileVersionInfoSize(PWideChar(FSelfPath + DriverDLLName), hHandle);
+      ZipFile := TZipFile.Create;
+
+      repeat
+        DriverPackage := SearchRec.Name;
+        //ShowLogString('Найден пакет драйвера ' + DriverPackage, ADDIN_E_INFO);
+
+        TmpDir := TPath.GetTempPath;
+        try System.SysUtils.DeleteFile(TmpDir + '\' + 'INFO.XML') except end;
+        try System.SysUtils.DeleteFile(TmpDir + '\' + 'MANIFEST.XML') except end;
+
+        try
+          ZipFile.Open(SelfPath + DriverPackage, zmRead);
+        except on E: Exception do
+          begin
+            ShowLogString('Ошибка открытия пакета драйвера ' + DriverPackage + ': ' + E.Message, ADDIN_E_FAIL);
+            Result := false;
+          end;
+        end;
+        if Result then
+          begin
+            try
+              ZipFile.Extract('INFO.XML', TmpDir);
+            except on E: Exception do
+              begin
+                ShowLogString('Ошибка извлечения пакета драйвера ' + DriverPackage + ': ' + E.Message, ADDIN_E_FAIL);
+                Result := false;
+              end;
+            end;
+            try
+              ZipFile.Extract('MANIFEST.XML', TmpDir);
+            except on E: Exception do
+              begin
+                ShowLogString('Ошибка извлечения пакета драйвера ' + DriverPackage + ': ' + E.Message, ADDIN_E_FAIL);
+                Result := false;
+              end;
+            end;
+          end;
+
+        FDLLName := '';
+
+        if Result then
+          try
+            XML := LoadXMLDocument(TmpDir + '\' + 'MANIFEST.XML');
+          except on E: Exception do
+            begin
+              ShowLogString('Ошибка обработки пакета драйвера ' + DriverPackage + ': ' + E.Message, ADDIN_E_FAIL);
+              Result := false;
+            end;
+          end;
+
+        if Result then
+          begin
+            for i := 0 to XML.DocumentElement.ChildNodes.Count - 1 do
+              if XML.DocumentElement.ChildNodes[i].NodeName = 'component' then
+                if (XML.DocumentElement.ChildNodes[i].Attributes['arch'] = 'i386') and (XML.DocumentElement.ChildNodes[i].Attributes['os'] = 'Windows') then
+                  begin
+                    FDLLName := XML.DocumentElement.ChildNodes[i].Attributes['path'];
+                    break;
+                  end;
+            XML._Release;
+          end;
+
+        try System.SysUtils.DeleteFile(TmpDir + '\' + 'MANIFEST.XML') except end;
+        Result := FDLLName <> '';
+
+        ATOLClassName := '';
+        if Result then
+          try
+            XML := LoadXMLDocument(TmpDir + '\' + 'INFO.XML');
+          except on E: Exception do
+            begin
+              ShowLogString('Ошибка обработки пакета драйвера ' + DriverPackage + ': ' + E.Message, ADDIN_E_FAIL);
+              Result := false;
+            end;
+          end;
+
+        if Result then
+          begin
+            ATOLClassName := XML.DocumentElement.ChildNodes['component'].Attributes['progid'];
+            XML._Release;
+          end;
+
+        try System.SysUtils.DeleteFile(TmpDir + '\' + 'INFO.XML') except end;
+        Result := ATOLClassName <> '';
+        if Result then ATOLClassName := StringReplace(ATOLClassName, 'AddIn.', '', []);
+
+        if Result then
+          begin
+            try
+              System.SysUtils.DeleteFile(TmpDir + '\' + FDLLName);
+              ZipFile.Extract(FDLLName, TmpDir);
+            except on E: Exception do
+              if not FileExists(TmpDir + '\' + FDLLName) then
+                begin
+                  ShowLogString('Ошибка извлечения пакета драйвера ' + DriverPackage + ': ' + E.Message, ADDIN_E_FAIL);
+                  Result := false;
+                end;
+            end;
+            FDLLName := TmpDir + '\' + FDLLName;
+          end
+        else
+          FDLLName := '';
+
+        ZipFile.Close;
+
+        if Result then break;
+      until System.SysUtils.FindNext(SearchRec) <> 0;
+
+      ZipFile.Free;
+      System.SysUtils.FindClose(SearchRec);
+    end;
+
+  if Result and FileExists(FDLLName) then
+    begin
+      FClassObject := TNativeAPIClass.Create;
+      if (not Assigned(FMemoryManager)) then FMemoryManager := TMemoryManager.Create;
+      if (not Assigned(FAddInDefBase)) then FAddInDefBase := TAddInDefBase.Create;
+
+      strLen := GetFileVersionInfoSize(PWideChar(FDLLName), hHandle);
       if strLen > 0 then
         begin
           GetMem(pwcInfo, strLen);
-          GetFileVersionInfo(PWideChar(FSelfPath + DriverDLLName), hHandle, strLen, pwcInfo);
+          GetFileVersionInfo(PWideChar(FDLLName), hHandle, strLen, pwcInfo);
           if VerQueryValue(Pointer(pwcInfo), '\', Pointer(pffiVersion), hHandle) then
             FDllInfo := pffiVersion^;
           FreeMem(pwcInfo);
         end;
 
-      if (HiWord(FDllInfo.dwFileVersionMS) < 9) or ((HiWord(FDllInfo.dwFileVersionMS) >= 9) and (LoWord(FDllInfo.dwFileVersionMS) < 11)) then
+      FDllHandle := LoadLibrary(PWideChar(FDLLName));
+      if FDllHandle = 0 then
         begin
-          ShowLogString('Версия драйвера ниже 9.11 не поддерживается!', ADDIN_E_FAIL);
+          ShowLogString('Ошибка загрузки библиотеки ' + ExtractFileName(FDllName) + '!', ADDIN_E_FAIL);
           Result := False;
         end
       else
         begin
-          FDllHandle := LoadLibrary(PWideChar(FSelfPath + DriverDllName));
-          if FDllHandle = 0 then
+          GetClassObjectFunc := GetProcAddress(FDllHandle, 'GetClassObject');
+          DestroyObjectFunc := GetProcAddress(FDllHandle, 'DestroyObject');
+
+          if (not Assigned(GetClassObjectFunc)) or (not Assigned(DestroyObjectFunc)) then
             begin
-              ShowLogString('Ошибка загрузки библиотеки ' + DriverDllName + '!', ADDIN_E_FAIL);
+              ShowLogString('Библиотека ' + ExtractFileName(FDllName) + 'не является 1C Native API библиотекой!', ADDIN_E_FAIL);
               Result := False;
             end
           else
             begin
-              GetClassObjectFunc := GetProcAddress(FDllHandle, 'GetClassObject');
-              DestroyObjectFunc := GetProcAddress(FDllHandle, 'DestroyObject');
+              res := 0;
+              try
+                res := GetClassObjectFunc(PWideChar(ATOLClassName), @FClassObject.ComponentBaseRec);
+              except
+              end;
 
-              if (not Assigned(GetClassObjectFunc)) or (not Assigned(DestroyObjectFunc)) then
+              if res = 0 then
                 begin
-                  ShowLogString('Библиотека ' + DriverDllName + 'не является 1C Native API библиотекой!', ADDIN_E_FAIL);
+                  ShowLogString('Не удалось создать экземпляр класса ' + ATOLClassName + '!', ADDIN_E_FAIL);
                   Result := False;
                 end
               else
                 begin
-                  res := 0;
                   try
-                    res := GetClassObjectFunc(PWideChar(ATOLClassName), @FClassObject.ComponentBaseRec);
-                  except
-                  end;
-                  
-                  if res = 0 then
-                    begin
-                      ShowLogString('Не удалось создать экземпляр класса ' + ATOLClassName + '!', ADDIN_E_FAIL);
-                      Result := False;
-                    end
-                  else
-                    begin
-                      try
-                        FClassObject.SetMemManager(@FMemoryManager.MemoryManagerRec);
-                        if not FClassObject.Init(@FAddInDefBase.AddInDefBaseRec) then
-                          begin
-                            ShowLogString('Ошибка инициализации класса ' + ATOLClassName + '!', ADDIN_E_FAIL);
-                            Result := False;
-                          end;
-                      except
+                    FClassObject.SetMemManager(@FMemoryManager.MemoryManagerRec);
+                    if not FClassObject.Init(@FAddInDefBase.AddInDefBaseRec) then
+                      begin
                         ShowLogString('Ошибка инициализации класса ' + ATOLClassName + '!', ADDIN_E_FAIL);
                         Result := False;
                       end;
-                    end;
+                  except
+                    ShowLogString('Ошибка инициализации класса ' + ATOLClassName + '!', ADDIN_E_FAIL);
+                    Result := False;
+                  end;
                 end;
             end;
         end;
@@ -198,6 +317,40 @@ begin
 
       if FDLLHandle <> 0 then FreeLibrary(FDllHandle);
       FDLLHandle := 0;
+
+      if FDLLName <> '' then try System.SysUtils.DeleteFile(FDLLName) except end;
+    end
+  else
+    begin
+      //ShowLogString('Драйвер ' + ExtractFileName(DriverPackage) + ' успешно подключен.', ADDIN_E_INFO);
+
+      MethodNum := FClassObject.FindMethod(PWideChar('GetDescription'));
+      if MethodNum >= 0 then
+        begin
+          V8RetValue.vt := VTYPE_EMPTY;
+          ParamsCount := FClassObject.GetNParams(MethodNum);
+          SetLength(V8Params, ParamsCount);
+          for i := 0 to ParamsCount - 1 do
+            V8Params[i].vt := VTYPE_EMPTY;
+          FClassObject.CallAsFunc(MethodNum, @V8RetValue, Pointer(V8Params), ParamsCount);
+
+          if V8Params[4].Value.bVal then
+            if not V8Params[5].Value.bVal then
+              begin
+                ShowLogString('Внимание! Основной драйвер не установлен! Полноценная работа невозможна!', ADDIN_E_IMPORTANT);
+                ShowLogString('Вы можете скачать драйвер по ссылке: ' + V8Params[6].Value.pwstrVal, ADDIN_E_IMPORTANT);
+              end;
+
+          for i := 0 to ParamsCount - 1 do
+            begin
+              if V8Params[i].vt = VTYPE_PSTR then
+                FMemoryManager.FreeMemory(Pointer(V8Params[i].Value.pstrVal));
+              if V8Params[i].vt = VTYPE_PWSTR then
+                FMemoryManager.FreeMemory(Pointer(V8Params[i].Value.pwstrVal));
+            end;
+
+          SetLength(V8Params, 0);
+        end;
     end;
 end;
 
@@ -214,7 +367,7 @@ begin
     begin
       try FClassObject.Done() except end;
       if Assigned(DestroyObjectFunc) then
-        DestroyObjectFunc(@FClassObject.ComponentBaseRec);
+        try DestroyObjectFunc(@FClassObject.ComponentBaseRec) except end;
       FClassObject.Free;
     end;
 
@@ -227,6 +380,8 @@ begin
 
   if FDLLHandle <> 0 then FreeLibrary(FDllHandle);
   FDLLHandle := 0;
+
+  if FDLLName <> '' then try System.SysUtils.DeleteFile(FDLLName) except end;
 end;
 
 procedure TWrapperObject.ShowLogString(const LogString: WideString; const MessageType: Integer);
@@ -240,8 +395,9 @@ begin
   ErrInfo.bstrDescription := LogString;
   ErrInfo.wCode := MessageType;
   ErrInfo.sCode := S_OK;
+
   try
-    FErrorLog.AddError(nil, ErrInfo);
+    FErrorLog.AddError(nil, @ErrInfo);
   finally
   end;
 end;
@@ -278,8 +434,14 @@ begin
       end;
     end;
 
-  if (Result = S_OK) and (not Assigned(FClassObject)) then
-    if not InitATOLObject then Result := S_FALSE;
+  if (Result = S_OK) then
+    if Assigned(DriverClassObject) then
+      FClassObject := DriverClassObject
+    else
+      if InitATOLObject then
+        DriverClassObject := FClassObject
+      else
+        Result := S_FALSE;
 
   if Result = S_FALSE then
     begin
@@ -293,7 +455,7 @@ end;
 
 function TWrapperObject.Done: HResult; stdcall;
 begin
-  DestroyATOLObject;
+  if Assigned(DriverClassObject) then DestroyATOLObject;
 
   if Assigned(FErrorLog) then FErrorLog._Release();
   //if Assigned(FEvent) then FEvent._Release();
@@ -301,6 +463,7 @@ begin
   //if Assigned(FStatusLine) then FStatusLine._Release();
   //if Assigned(FExtWndsSupport) then FExtWndsSupport._Release();
 
+  DriverClassObject := nil;
   Done := S_OK;
 end;
 
@@ -610,6 +773,7 @@ begin
 end;
 
 initialization
+  DriverClassObject := nil;
   ComServer.SetServerName('AddIn');
   TComObjectFactory.Create(ComServer, TWrapperObject, CLSID_AddInObject, c_AddinName, 'V7 AddIn 2.0', ciMultiInstance);
 
